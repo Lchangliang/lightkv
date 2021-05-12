@@ -2,185 +2,57 @@
 
 namespace lightkv {
 
-int LightKV::start() {
-    butil::EndPoint addr(butil::my_ip(), FLAGS_port);
-    braft::NodeOptions node_options;
-    if (node_options.initial_conf.parse_from(FLAGS_conf) != 0) {
-        LOG(ERROR) << "Fail to parse configuration `" << FLAGS_conf << '\'';
-        return -1;
-    }
-    node_options.election_timeout_ms = FLAGS_election_timeout_ms;
-    node_options.fsm = this;
-    node_options.node_owns_fsm = false;
-    node_options.snapshot_interval_s = FLAGS_snapshot_interval;
-    std::string prefix = "local://" + FLAGS_raft_data_path;
-    node_options.log_uri = prefix + "/log";
-    node_options.raft_meta_uri = prefix + "/raft_meta";
-    node_options.snapshot_uri = prefix + "/snapshot";
-    node_options.disable_cli = FLAGS_disable_cli;
-    braft::Node* node = new braft::Node(FLAGS_group, braft::PeerId(addr));
-    if (node->init(node_options) != 0) {
-        LOG(ERROR) << "Fail to init raft node";
-        delete node;
-        return -1;
-    }
-    _node = node;
-    return 0;
-}
-
-void LightKV::operate(const LightKVRequest* request,
-                       LightKVResponse* response,
-                       ::google::protobuf::Closure* done)
-{
+void StorageServiceImpl::init_store(::google::protobuf::RpcController* controller,
+                       const ::lightkv::InitStoreRequest* request,
+                       ::lightkv::InitStoreResponse* response,
+                       ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
-    // Serialize request to the replicated write-ahead-log so that all the
-    // peers in the group receive this request as well.
-    // Notice that _value can't be modified in this routine otherwise it
-    // will be inconsistent with others in this group.
-        
-    const int64_t term = _leader_term.load(butil::memory_order_relaxed);
-    if (term < 0) {
-        response->set_redirect(redirect().c_str());
+    LOG(INFO) << "receive a init_store request, shard id: " + std::to_string(request->shard_id());
+    std::string endpoints;
+    for (int i = 0; i < request->peers_size(); i++) {
+        std::string tmp;
+        endpoint_to_string(request->peers(i), &tmp);
+        endpoints += tmp + ","; 
+    }
+    LOG(INFO) << "Peers: " + endpoints;
+    std::unique_lock<std::shared_mutex> lock(storage_map->_mutex);
+    ShardID shard_id = request->shard_id();
+    if (storage_map->kv_stores.find(shard_id) != storage_map->kv_stores.end()) {
+        response->mutable_error()->set_error_message("The storage already has shard: " + std::to_string(shard_id));
         response->mutable_error()->set_error_code(-1);
-        response->mutable_error()->set_error_message("The address is not leader.");
         return ;
     }
-    if (request->operator_type() == SELECT) {
-        select(request, response, done);
-    } else {
-        butil::IOBuf log;
-        butil::IOBufAsZeroCopyOutputStream wrapper(&log);
-        if (!request->SerializeToZeroCopyStream(&wrapper)) {
-            LOG(ERROR) << "Fail to serialize request";
-            response->mutable_error()->set_error_code(-3);
-            response->mutable_error()->set_error_message("Fail to serialize request");
-            return;
-        }
-        // Apply this log as a braft::Task
-        braft::Task task;
-        task.data = &log;
-        // This callback would be iovoked when the task actually excuted or
-        // fail
-        task.done = new LightKVClosure(this, request, response,
-                                            done_guard.release());
-
-        if (FLAGS_check_term) {
-            // ABA problem can be avoid if expected_term is set
-            task.expected_term = term;
-        }
-        // Now the task is applied to the group, waiting for the result.
-        _node->apply(task);
+    std::string path = FLAGS_store_path + "/" + std::to_string(FLAGS_port) + "/" + std::to_string(shard_id);
+    mkdir(path.c_str(), 0755);
+    std::shared_ptr<StoreInterface> store(new RocksDBStoreImpl(shard_id));
+    LightKV kv_store(store, shard_id);
+    std::string conf = "";
+    for (int i = 0; i < request->peers_size(); i++) {
+        const lightkv::EndPoint& peer = request->peers(i);
+        conf += peer.ip() + ":" + std::to_string(peer.port()) + ":" + std::to_string(shard_id) + ",";
+    }
+    storage_map->kv_stores.insert(std::make_pair(shard_id, kv_store));
+    Error error = storage_map->kv_stores.find(shard_id)->second.start(conf);
+    response->mutable_error()->CopyFrom(error);
+    if (error.error_code() != 0) {
+        storage_map->kv_stores.erase(shard_id);
     }
 }
 
-void LightKV::select(const LightKVRequest* request,
-                       LightKVResponse* response,
-                       ::google::protobuf::Closure* done)
-{
-    LOG(WARNING) << "receive a select request";
-    std::vector<std::pair<std::string, std::string>> pairs;
-    // This is the leader and is up-to-date. It's safe to respond client
-    switch (request->select_type())
-    {
-    case SINGLE:   
-        response->mutable_error()->CopyFrom(_store->select(request->lkey(), &pairs));
-        break;
-    case PREFIX:
-        response->mutable_error()->CopyFrom(_store->select_prefix(request->lkey(), &pairs));
-        break;
-    case RANGE:
-        response->mutable_error()->CopyFrom(_store->select_range(request->lkey(), request->rkey(), &pairs));
-        break;
-    }
-    for (auto pair : pairs) {
-        response->add_keys(pair.first);
-        response->add_values(pair.second);
-    }
-}
-
-void LightKV::on_apply(braft::Iterator& iter)
-{
-    // A batch of tasks are committed, which must be processed through 
-    // |iter|
-    for (; iter.valid(); iter.next()) {
-        butil::IOBuf log = iter.data();
-        std::string type = log.to_string();
-        // This guard helps invoke iter.done()->Run() asynchronously to
-        // avoid that callback blocks the StateMachine.
-        braft::AsyncClosureGuard closure_guard(iter.done());
-        if (iter.done()) {
-            LightKVClosure* c = dynamic_cast<LightKVClosure*>(iter.done());
-            auto request = c->request();
-            switch (request->operator_type()) {
-                case INSERT:
-                    c->response()->mutable_error()->CopyFrom(_store->insert(request->lkey(), request->value()));
-                    break;
-                case DELETE:
-                    c->response()->mutable_error()->CopyFrom(_store->delete_(request->lkey()));
-                    break;
-            }
-        } else {
-            butil::IOBufAsZeroCopyInputStream wrapper(iter.data());
-            LightKVRequest request;
-            CHECK(request.ParseFromZeroCopyStream(&wrapper));
-            switch (request.operator_type()) {
-                case INSERT:
-                    _store->insert(request.lkey(), request.value());
-                    break;
-                case DELETE:
-                    _store->delete_(request.lkey());
-                    break;
-            }
-        }
-    }
-}
-
-void LightKVClosure::Run() {
-    // Auto delete this after Run()
-    std::unique_ptr<LightKVClosure> self_guard(this);
-    // Respond this RPC.
-    brpc::ClosureGuard done_guard(_done);
-    if (status().ok()) {
-        return;
-    }
-    // Try redirect if this request failed.
-    _response->set_redirect(_kv_store->redirect());
-    _response->mutable_error()->set_error_code(-1);
-    _response->mutable_error()->set_error_message("The address maybe is not leader.");
-}
-
-void LightKV::on_snapshot_save(::braft::SnapshotWriter* writer,
-                                  ::braft::Closure* done)
-{
+void StorageServiceImpl::delete_store(::google::protobuf::RpcController* controller,
+                       const ::lightkv::DeleteStoreRequest* request,
+                       ::lightkv::DeleteStoreResponse* response,
+                       ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
-    std::string snapshot_path = writer->get_path() + "/rocksdb";
-    LOG(INFO) << "Saving snapshot to " << snapshot_path;
-    Error error = _store->do_checkpoint(snapshot_path);
-    if (error.error_code() != 0) {
-        LOG(ERROR) << error.error_message();
-        return ;
-    }
-    std::vector<std::string> files;
-    get_files(snapshot_path, files);
-    for (std::string& file : files) {
-        writer->add_file("rocksdb/"+ file);
+    std::unique_lock<std::shared_mutex> lock(storage_map->_mutex);
+    ShardID shard_id = request->shard_id();
+    if (storage_map->kv_stores.find(shard_id) != storage_map->kv_stores.end()) {
+        std::string path = FLAGS_store_path + "/" + std::to_string(FLAGS_port)
+                             + "/" + std::to_string(shard_id);
+        storage_map->kv_stores.erase(shard_id);
+        rm_dir(path.c_str());
     }
 }
 
-int LightKV::on_snapshot_load(::braft::SnapshotReader* reader)
-{
-    CHECK(!is_leader()) << "Leader is not supposed to load snapshot";
-    std::vector<std::string> files;
-    std::string snapshot_path = reader->get_path();
-    reader->list_files(&files);
-    for (auto& file : files) {
-        file = snapshot_path + "/" + file;
-    }
-    Error error = _store->read_snapshot(files);
-    if (error.error_code() != 0) {
-        LOG(ERROR) << error.error_message();
-    }
-    return 0;
-}
 
 } // namespace lightkv

@@ -1,16 +1,18 @@
 #include "storage_service.h"
+#include "heartbeat.h"
 
-DEFINE_string(store_path, "/tmp/rocksdb_tmp", "rocksdb data path");
+DEFINE_string(store_path, "/tmp/storage", "rocksdb data path");
 DEFINE_bool(check_term, true, "Check if the leader changed to another term");
 DEFINE_bool(disable_cli, false, "Don't allow raft_cli access this node");
 DEFINE_bool(log_applied_task, false, "Print notice log when a task is applied");
 DEFINE_int32(election_timeout_ms, 5000, 
             "Start election in such milliseconds if disconnect with the leader");
+DEFINE_string(ip, "127.0.1.1", "ip of this peer");
 DEFINE_int32(port, 8100, "Listen port of this peer");
-DEFINE_int32(snapshot_interval, 30, "Interval between each snapshot");
-DEFINE_string(conf, "", "Initial configuration of the replication group");
+DEFINE_string(proxy_ip, "127.0.1.1", "ip of proxy_server");
+DEFINE_int32(proxy_port, 7300, "Listen port of proxy_server");
+DEFINE_int32(snapshot_interval, 60, "Interval between each snapshot");
 DEFINE_string(group, "Lightkv", "Id of the replication group");
-DEFINE_string(raft_data_path, "/tmp/raft_tmp", "raft data path");
 
 int main(int argc, char *argv[]) {
     google::ParseCommandLineFlags(&argc, &argv, true);
@@ -19,10 +21,9 @@ int main(int argc, char *argv[]) {
     // Generally you only need one Server.
     brpc::Server server;
 
-    lightkv::StoreInterface *_store =  new lightkv::RocksDBStoreImpl(FLAGS_store_path);
-    lightkv::LightKV kv_store(_store);
-    lightkv::StorageServiceImpl service(&kv_store);
-
+    lightkv::StorageMap storage_map;
+    lightkv::StorageServiceImpl service(&storage_map);
+    lightkv::HeartBeat heartBeat(&storage_map);
     // Add your service into RPC server
     if (server.AddService(&service, 
                           brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
@@ -48,13 +49,10 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    // It's ok to start LightKV;
-    if (kv_store.start() != 0) {
-        LOG(ERROR) << "Fail to start LightKV";
-        return -1;
-    }
+    service.start_raft_service();
 
     LOG(INFO) << "LightKV service is running on " << server.listen_address();
+    heartBeat.start();
     // Wait until 'CTRL-C' is pressed. then Stop() and Join() the service
     while (!brpc::IsAskedToQuit()) {
         sleep(1);
@@ -63,12 +61,9 @@ int main(int argc, char *argv[]) {
     LOG(INFO) << "LightKV service is going to quit";
 
     // Stop lightkv before server
-    kv_store.shutdown();
     server.Stop(0);
 
     // Wait until all the processing tasks are over.
-    kv_store.join();
     server.Join();
-    delete _store;
     return 0;
 }

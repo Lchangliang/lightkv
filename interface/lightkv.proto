@@ -4,26 +4,34 @@ option cc_generic_services = true;
 
 service StorageService {
     rpc init_store(InitStoreRequest) returns(InitStoreResponse);
-    rpc operate(LightKVRequest) returns (LightKVResponse);
+    rpc delete_store(DeleteStoreRequest) returns(DeleteStoreResponse);
+    rpc operate(LightKVRequest) returns(LightKVResponse);
 }
 
 service ProxyService {
-    rpc insert(InsertRequest) returns (InsertResponse);
-    rpc select(SelectRequest) returns (SelectResponse);
-    rpc delete_(DeleteRequest) returns (DeleteResponse);
-    rpc heart_beat(HeartBeatRequest) returns (HeaerBeatResponse);
+    rpc insert(InsertRequest) returns(InsertResponse);
+    rpc select(SelectRequest) returns(SelectResponse);
+    rpc delete_(DeleteRequest) returns(DeleteResponse);
+    rpc heart_beat(HeartBeatRequest) returns(HeartBeatResponse);
+    rpc get_shards_state(ShardsStateRequest) returns(ShardsStateResponse);
 };
+
+message ShardsStateRequest {}
+
+message ShardState {
+    int32 shard_id = 1;
+    EndPoint leader = 2;
+    repeated EndPoint followers = 3;
+}
+
+message ShardsStateResponse {
+    repeated ShardState shards_state = 1;
+}
 
 enum OperatorType {
     SELECT = 0;
     INSERT = 1;
     DELETE = 2;
-}
-
-enum SelectType {
-    SINGLE = 0;
-    PREFIX = 1;
-    RANGE = 2;
 }
 
 message Error {
@@ -37,18 +45,16 @@ message EndPoint {
 }
 
 message LightKVRequest {
-    OperatorType operator_type = 1;
-    SelectType select_type = 2;
-    string lkey = 3;
-    string rkey = 4;
-    string value = 5;
+    int32 shard_id = 1;
+    OperatorType operator_type = 2;
+    string key = 3;
+    string value = 4;
 };
 
 message LightKVResponse {
     Error error = 1;
     string redirect = 2;
-    repeated string keys = 3;
-    repeated string values = 4;
+    string value = 3;
 };
 
 message DeleteRequest {
@@ -71,21 +77,18 @@ message InsertResponse {
 };
 
 message SelectRequest {
-    SelectType type = 1;
-    string lkey = 2;
-    string rkey = 3;
+    string key = 1;
 };
 
 message SelectResponse {
     Error error = 1;
     string redirect = 2;
-    repeated string keys = 3;
-    repeated string values = 4;
+    string value = 3;
 };
 
 message InitStoreRequest {
-    int32 shardId = 1;
-    repeated EndPoint n = 2;
+    int32 shard_id = 1;
+    repeated EndPoint peers = 2;
 }
 
 message InitStoreResponse {
@@ -93,12 +96,10 @@ message InitStoreResponse {
 }
 
 message DeleteStoreRequest {
-    
+    int32 shard_id = 1;
 }
 
-message DeleteStoreResponse {
-
-}
+message DeleteStoreResponse {}
 
 message HeartBeatRequest {
     EndPoint address = 1;
@@ -106,4 +107,4 @@ message HeartBeatRequest {
     repeated int32 leader_shards = 3;
 }
 
-message HeaerBeatResponse {}
+message HeartBeatResponse {}

@@ -1,0 +1,10 @@
+protoc -I=/home/lightman/repos/lightkv/interface --cpp_out=./interface/ /home/lightman/repos/lightkv/interface/lightkv.proto
+g++ test/rocksdb_store_test.cc storage/rocksdb_store.cc -I . -lrocksdb -lpthread -std=c++11 -ldl -lgflags
+g++ storage/main.cc interface/lightkv.pb.cc storage/storage_service.cc storage/rocksdb_store.cc util/util.cc storage/state_machine.cc storage/heartbeat.cc -I . -lrocksdb -lpthread -std=c++17 -ldl -lgflags -lprotobuf -lbraft  -g -o bin/lightkv_server
+g++ proxy/main.cc interface/lightkv.pb.cc proxy/proxy_service.cc proxy/shard_manager.cc util/util.cc -I . -lrocksdb -lpthread -std=c++11 -ldl -lgflags -lprotobuf -lbraft -o bin/lightkv_client
+protoc -I=/home/lightman/repos/lightkv/interface --python_out=./script/ /home/lightman/repos/lightkv/interface/lightkv.proto
+~/repos/braft/build/output/bin$ ./braft_cli add_peer --group=Lightkv --peer=127.0.1.1:8104 --conf=127.0.1.1:8100:0,127.0.1.1:8101:0,127.0.1.1:8102:0,127.0.1.1:8103:0,127.0.1.1:8104:0
+
+
+
+
